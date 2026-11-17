@@ -31,9 +31,10 @@
 | VPC | 신규 생성 (프라이빗 서브넷 중심, NAT 최소) |
 | Bedrock | **PrivateLink** (`bedrock-runtime` 등 VPC endpoint) |
 | Direct Connect | **미사용** |
-| 노트북/Space 인스턴스 | `ml.t3.medium`, `ml.t3.large`, `ml.t3.xlarge` 만 허용 |
+| JupyterLab Space 인스턴스 | `ml.t3.medium`, `ml.t3.large`, `ml.t3.xlarge` 만 허용 (**IAM Deny**) |
+| Notebooks 인스턴스 | 정책 의도: `sc.t3.*` 만 허용 — **자동 차단 불가**, **감지·SNS 알람**만 |
 | SageMaker Data Agent | 비활성화 (IdC 토글 + IAM Deny) |
-| 모니터링 | Lambda + DynamoDB + CloudWatch Dashboard (`dashboard.py`) |
+| 모니터링 | Lambda + DynamoDB + CloudWatch Dashboard (`dashboard.py`) + Notebooks **감지·알람** |
 
 ## 실행 방법
 
@@ -78,7 +79,9 @@ Organization IdC primary가 **Tokyo (`ap-northeast-1`)** 이므로 SMUS도 동�
 | Usage monitor Lambda | `lambda-usage-monitor-for-smus-kr` |
 | Cost rollup Lambda | `lambda-cost-rollup-for-smus-kr` |
 | Inventory / events 테이블 | `smus-kr-resource-inventory`, `smus-kr-usage-events`, `smus-kr-cost-by-user` |
+| EventBridge 규칙 | `rule-smus-reconcile-for-smus-kr`, `rule-smus-cost-for-smus-kr`, `rule-smus-api-for-smus-kr`, `rule-smus-notebook-guard-for-smus-kr` |
 | CloudWatch Dashboard | `dashboard-smus-kr-usage` |
+| Notebooks deny 알람 | `alarm-smus-notebook-deny-for-smus-kr` → SNS `sns-smus-notebook-deny-for-smus-kr` |
 
 ## 네트워크: VPC + Bedrock PrivateLink
 
@@ -108,13 +111,73 @@ SMUS 왼쪽 메뉴에 **Notebooks**와 **JupyterLab**(IDEs)이 따로 있습니�
 | 셀 | Python, SQL, Spark, 자연어, 테이블/차트 셀 | 일반 Jupyter 노트북/터미널/파일 브라우저 |
 | AI | **SageMaker Data Agent** 내장에 가깝게 설계 | Amazon Q 등 IDE 쪽 보조 |
 | 컴퓨트 | 관리형/서버리스 노트북 컴퓨트 (Athena Spark 등) | EC2 Space (`ml.t3.*` 등) |
-| 인스턴스 제한 | 이 README의 Space IAM Deny와는 경로가 다름 | **아래 인스턴스 제한의 주 대상** |
+| 인스턴스 이름 | **`sc.*`** (예: `sc.g5.xlarge`) | **`ml.*`** (예: `ml.t3.large`) |
+| 인스턴스 제한 | **사전 IAM Deny 불가** · **자동 Stop도 불가** → **감지·알람만** (아래) | **IAM Deny** (아래) |
+| 과금 | 컴퓨트 실행 중 과금, 유휴 시 자동 종료(기본 ~1시간). 서버리스 ≠ 즉시 무과금. 비허용 타입이 뜨면 **수동 Stop 전까지 과금** | Space/`CreateApp` 실행 중 과금 |
 
 한 줄 요약: **Notebooks = 데이터/SQL 중심의 새 노트북**, **JupyterLab = Space를 띄우는 기존 Jupyter IDE**.
+
+### Notebooks (`sc.*`) 제한 — 감지·알람만 (자동 차단 불가)
+
+> **결론**: Notebooks `sc.*`는 JupyterLab처럼 **막을 수 없습니다.**  
+> IAM Deny도, Lambda **StopCompute**도, ENI quarantine도 **강제 종료/차단으로 쓸 수 없음**이 확인되어, 운영은 **CloudTrail 감지 → 메트릭/DDB → SNS 알람 → 포털에서 수동 Stop** 으로 합니다.
+
+CloudTrail 기준 Notebooks 기동 API:
+
+| 항목 | 값 |
+|------|-----|
+| EventSource | `datazone.amazonaws.com` |
+| eventName | **`StartNotebookCompute`** |
+| 주체 | `datazone_usr_role_*` (프로젝트 사용자 역할) |
+| 파라미터 | `computeConfig.instanceType` = `sc.g5.xlarge` 등 |
+
+정책상 허용으로 보는 타입: **`sc.t3.medium`**, **`sc.t3.large`**, **`sc.t3.xlarge`**  
+(UI·API에서 그 외 `sc.g5.*` / `sc.g4dn.*` 등도 **시작 가능**합니다.)
+
+#### 왜 자동 차단이 안 되나
+
+| 시도 | 결과 |
+|------|------|
+| IAM Deny on `datazone:StartNotebookCompute` | 인스턴스 타입 **condition key 없음** → allowlist Deny 불가 |
+| Studio `HiddenInstanceTypes` | **`ml.*`만** 대상. **`sc.*` Notebooks UI에는 미적용** |
+| Lambda → DataZone `StopCompute` | 포털 Stop에 필요한 `im.amazonaws.com` 세션 컨텍스트가 없어 **403/404** 등 → **강제 Stop 불가** |
+| ENI deny-all SG quarantine | 신규 연결에 영향 줄 수 있으나 **이미 떠 있는 커널/실행을 죽이지 못함** |
+
+#### 실제 운영 경로 (감지·알람)
+
+```
+CloudTrail StartNotebookCompute (비허용 sc.* 예: sc.g5.xlarge)
+        │
+        ▼
+ EventBridge rule-smus-notebook-guard-for-smus-kr
+        │
+        ▼
+ lambda-usage-monitor (mode=notebook_guard)
+        │
+        ├─ DynamoDB events/inventory
+        ├─ CW metric NotebookComputeDenied / NotebookComputeDeniedTotal
+        └─ (Stop/quarantine 시도는 남아 있을 수 있으나 차단 수단으로 신뢰하지 않음)
+                │
+                ▼
+ CloudWatch alarm-smus-notebook-deny-for-smus-kr
+        │  NotebookComputeDeniedTotal >= 1 (1분)
+        ▼
+ SNS sns-smus-notebook-deny-for-smus-kr → email (Confirm 필요)
+        │
+        ▼
+ 운영자: Unified Studio 포털에서 해당 Notebook compute 수동 Stop
+```
+
+- UI Configure에 `sc.g5.xlarge` 등이 **그대로 노출**됩니다.
+- 메트릭: `NotebookComputeAllowed` / `NotebookComputeDenied` / `NotebookComputeDeniedTotal`
+- 알람: `alarm-smus-notebook-deny-for-smus-kr` → SNS `sns-smus-notebook-deny-for-smus-kr`  
+  (`auth.idc_admin_email` 구독; 메일 **Confirm** 필요)
+- `EC2InsufficientCapacityError` 등은 **용량 부족**이지 가드레일 차단이 아님.
 
 참고:
 
 - [Notebooks](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/notebooks.html)
+- [Manage compute environments](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/manage-compute-environments.html)
 - [JupyterLab IDE](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/jupyterlab.html)
 
 ## 노트북/Space 인스턴스 제한
@@ -133,6 +196,8 @@ SMUS 왼쪽 메뉴에 **Notebooks**와 **JupyterLab**(IDEs)이 따로 있습니�
 - UI hide는 API 한도(20개) 때문에 **전 타입 차단이 아니라 우선 순위 숨김**입니다. 완전한 강제는 IAM Deny입니다.
 - Unified Studio JupyterLab **스페이스 구성** UI는 Studio 포털과 다를 수 있어, hide가 항상 반영되지 않을 수 있습니다. 그때도 IAM Deny면 **저장 후 재시작**은 거부됩니다.
 - “허용한 것만 보이게” 하는 allowlist UI API는 없고, **숨길 타입을 최대 20개까지 지정**하는 방식만 지원합니다.
+- **와일드카드 불가**: `ml.g5.*`, `*.g5.*` 같은 패턴은 지원하지 않습니다. [API enum](https://docs.aws.amazon.com/sagemaker/latest/APIReference/API_StudioWebPortalSettings.html)에 있는 **정확한 타입 문자열**만 나열해야 합니다 (예: `ml.g5.xlarge`, `ml.g5.2xlarge` …).
+- **Notebooks(`sc.*`)에는 적용되지 않음**: `HiddenInstanceTypes`는 Studio **`ml.*`** UI 드롭다운용입니다. Unified Studio **Notebooks**의 `sc.g5.*` / `sc.g4dn.*` 등은 이 설정으로 **숨길 수 없고**, 시작도 막지 못합니다. Notebooks는 [감지·알람만 (자동 차단 불가)](#notebooks-sc-제한--감지알람만-자동-차단-불가)을 참고하세요.
 
 #### Studio UI hide API (`UpdateDomain`)
 
@@ -160,11 +225,22 @@ sagemaker.update_domain(
     DomainId="d-rjxdx34xg67o",
     DefaultUserSettings={
         "StudioWebPortalSettings": {
-            "HiddenInstanceTypes": ["ml.r5.large", "..."]  # max 20
+            "HiddenInstanceTypes": ["ml.r5.large", "..."]  # max 20; exact enum only — no wildcards
         }
     },
 )
 ```
+
+g5 계열을 숨기려면 와일드카드 없이 **개별 나열**해야 합니다 (8개가 20개 슬롯을 차지함):
+
+```json
+"HiddenInstanceTypes": [
+  "ml.g5.xlarge", "ml.g5.2xlarge", "ml.g5.4xlarge", "ml.g5.8xlarge",
+  "ml.g5.12xlarge", "ml.g5.16xlarge", "ml.g5.24xlarge", "ml.g5.48xlarge"
+]
+```
+
+> **주의**: 위 예시는 **Space/Studio `ml.g5.*` UI hide**입니다. **Notebooks `sc.g5.*`는 대상이 아닙니다.**
 
 `installer.py`의 `apply_studio_ui_instance_hide()`가 설치 시 이 API를 호출합니다 (허용 3종 제외, 흔한 비허용 타입 우선 최대 20개).
 
@@ -245,31 +321,38 @@ SMUS가 프로젝트를 만들 때 IAM 역할 `datazone_usr_role_<projectId>_<en
 
 1. 계정 내 IAM 역할을 `list_roles`로 순회
 2. 이름이 `datazone_usr_role_` 로 시작하는 역할만 선택
-3. 이미 attach되어 있으면 skip, 없으면 `AttachRolePolicy(guardrails)`
-4. 결과를 `config.json` → `resources.guardrails_attached_roles` 에 기록
+3. Guardrails 정책(인스턴스 Deny + Data Agent Deny) `AttachRolePolicy`
+4. (레거시) Notebooks Stop 시도용 inline/`trust`가 남아 있을 수 있으나 **자동 차단 수단으로 쓰지 않음** — 운영은 감지·알람
+5. 결과를 `config.json` → `resources.guardrails_attached_roles` 에 기록
 
 도메인/프로필 설정 직후 `main()`에서 한 번 호출됩니다.  
 같은 실행에서 `apply_studio_ui_instance_hide`로 SageMaker 도메인 `HiddenInstanceTypes`(최대 20개)도 적용합니다.
+
+Guardrails 정책에는 JupyterLab Deny와 함께 Data Agent Deny가 포함됩니다:  
+`datazone:SendMessage|GenerateCode|StartConversation|GetConversation|ListConversations`
 
 **2) 이후 신규 프로젝트 (`lambda-usage-monitor` reconcile)**
 
 프로젝트는 installer 이후에 만들어지므로, 새 `datazone_usr_role_*`는 설치 시점 scan에 없습니다.
 
 - EventBridge `rate(15 minutes)` → `lambda-usage-monitor-for-smus-kr` (`mode=reconcile`)
-- reconcile 끝에서 `attach_guardrails_to_project_roles()` 재실행 (동일 prefix 매칭)
-- 정책 ARN은 Lambda 환경변수 `GUARDRAILS_POLICY_ARN` (installer가 배포 시 주입)
-- Lambda 실행 역할에 `iam:ListRoles` / `ListAttachedRolePolicies` / `AttachRolePolicy` 권한 포함
+- reconcile 끝에서 `attach_guardrails_to_project_roles()` 재실행 (Deny attach + notebook-stop inline/trust)
+- 정책 ARN은 Lambda 환경변수 `GUARDRAILS_POLICY_ARN`, allowlist는 `ALLOWED_NOTEBOOK_INSTANCE_TYPES`
+- Lambda 실행 역할: `iam:ListRoles` / `ListAttachedRolePolicies` / `AttachRolePolicy` / `PutRolePolicy` / `UpdateAssumeRolePolicy` / `sts:AssumeRole` on `datazone_usr_role_*`
 
 ```
 installer.py
-  └─ attach_guardrails_to_project_roles()  ──► 기존 datazone_usr_role_* + Deny
+  └─ attach_guardrails_to_project_roles()
+        ├─ Deny(guardrails) attach
+        ├─ inline smus-notebook-compute-stop
+        └─ trust usage-monitor Lambda
 
 프로젝트 신규 생성 (SMUS)
   └─ datazone_usr_role_NEW 생성 (정책 없음)
         │
         ▼ (최대 ~15분)
 lambda-usage-monitor reconcile
-  └─ attach_guardrails_to_project_roles()  ──► NEW 역할에도 Deny attach
+  └─ 동일 attach (Deny + notebook-stop inline/trust)
 ```
 
 ### 기본값
@@ -290,18 +373,18 @@ IdC 사용자가 만든 **노트북/Space 종류·상태·사용 형태**와 **�
 ```
 CloudTrail / SageMaker API 이벤트
         │
-        ▼
- EventBridge ──► lambda-usage-monitor ──► DynamoDB (events + inventory)
-        ▲                                         │
-        │         EventBridge schedule (15m)       │
-        └──────── lambda-usage-monitor (reconcile)─┘
-                                                  │
- Cost Explorer (일 1회)                            │
-        │                                         ▼
- lambda-cost-rollup ──► DynamoDB cost-by-user   CloudWatch Metrics
-                                                  │
-                                                  ▼
-                                    dashboard.py → CloudWatch Dashboard
+        ├─ Space/App API ──► rule-smus-api-for-smus-kr
+        └─ StartNotebookCompute ──► rule-smus-notebook-guard-for-smus-kr
+                │
+                ▼
+         lambda-usage-monitor ──► DynamoDB (events + inventory)
+                ▲                      │
+                │   schedule (15m)     ├─ Notebooks: Denied 메트릭
+                └─ reconcile (+ guardrails attach)
+                                          │
+ Cost Explorer (일 1회)                    ├─ alarm → SNS (수동 Stop 유도)
+        │                                 ▼
+ lambda-cost-rollup → cost-by-user     CloudWatch Metrics / Dashboard
 ```
 
 ### 무엇을 보나
@@ -323,6 +406,7 @@ CloudTrail / SageMaker API 이벤트
 | P1 | Cost allocation tag 활성화 + **일별 Cost Explorer rollup** | 사용자별 비용 (태그 활성화 후 24~48시간 지연) |
 | P1 | `sourceIdentity` / user-profile 태그 강제 | CloudTrail·비용 귀속 정확도 |
 | P2 | Idle Space 알림 (N일 InService + 무활동) | 비용 누수 방지 |
+| P0 | Notebooks deny SNS 알람 (`NotebookComputeDeniedTotal`) | sc.* 강제 Stop 불가 → 감지 즉시 알림 |
 | P2 | Budgets + SNS (사용자/도메인 한도) | 예산 초과 조기 경보 |
 | P3 | Athena + CUR 상세 분석 | 장기·세분화 비용 리포트 |
 

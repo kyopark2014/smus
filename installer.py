@@ -32,6 +32,8 @@ REGION = "ap-northeast-1"
 DOMAIN_NAME = "smus-kr"
 DOMAIN_VERSION = "V2"
 ALLOWED_INSTANCE_TYPES = ["ml.t3.medium", "ml.t3.large", "ml.t3.xlarge"]
+# Notebooks managed compute (sc.*) — post-hoc StopCompute allowlist
+ALLOWED_NOTEBOOK_INSTANCE_TYPES = ["sc.t3.medium", "sc.t3.large", "sc.t3.xlarge"]
 # StudioWebPortalSettings.HiddenInstanceTypes (API enum). Allowed types are excluded.
 _STUDIO_INSTANCE_TYPE_ENUM = [
     "ml.t3.micro", "ml.t3.small", "ml.t3.medium", "ml.t3.large", "ml.t3.xlarge", "ml.t3.2xlarge",
@@ -113,6 +115,8 @@ TABLE_INVENTORY = f"{PROJECT_NAME}-resource-inventory"
 TABLE_EVENTS = f"{PROJECT_NAME}-usage-events"
 TABLE_COST = f"{PROJECT_NAME}-cost-by-user"
 DASHBOARD_NAME = f"dashboard-{PROJECT_NAME}-usage"
+SNS_NOTEBOOK_DENY = f"sns-smus-notebook-deny-for-{PROJECT_NAME}"
+ALARM_NOTEBOOK_DENY = f"alarm-smus-notebook-deny-for-{PROJECT_NAME}"
 SG_ENDPOINT = f"vpce-for-{PROJECT_NAME}"
 DEFAULT_PROJECT_PROFILE_NAME = "default-all-capabilities"
 PROVISIONING_MANAGED_POLICIES = [
@@ -705,8 +709,22 @@ def create_domain_roles(iam, account_id: str, cfg: Dict[str, Any]) -> Dict[str, 
                             "sagemaker:DescribeDomain",
                             "sagemaker:UpdateDomain",
                             "iam:ListRoles",
+                            "iam:GetRole",
                             "iam:ListAttachedRolePolicies",
                             "iam:AttachRolePolicy",
+                            "iam:PutRolePolicy",
+                            "iam:UpdateAssumeRolePolicy",
+                            "datazone:StopCompute",
+                            "datazone:GetCompute",
+                            "datazone:StopNotebookCompute",
+                            "datazone:GetNotebookCompute",
+                            "datazone:GetEnvironmentCredentials",
+                            "ec2:DescribeNetworkInterfaces",
+                            "ec2:ModifyNetworkInterfaceAttribute",
+                            "ec2:DescribeSecurityGroups",
+                            "ec2:CreateSecurityGroup",
+                            "ec2:RevokeSecurityGroupEgress",
+                            "ec2:CreateTags",
                             "dynamodb:PutItem",
                             "dynamodb:UpdateItem",
                             "dynamodb:GetItem",
@@ -717,7 +735,17 @@ def create_domain_roles(iam, account_id: str, cfg: Dict[str, Any]) -> Dict[str, 
                             "tag:GetResources",
                         ],
                         "Resource": "*",
-                    }
+                    },
+                    {
+                        "Sid": "AssumeProjectUserRolesForNotebookStop",
+                        "Effect": "Allow",
+                        "Action": [
+                            "sts:AssumeRole",
+                            "sts:TagSession",
+                            "sts:SetSourceIdentity",
+                        ],
+                        "Resource": f"arn:aws:iam::{account_id}:role/{PROJECT_USER_ROLE_PREFIX}*",
+                    },
                 ],
             }
         },
@@ -835,16 +863,72 @@ def note_idc_admin(cfg: Dict[str, Any], email: Optional[str]) -> None:
     print("    5) Guardrails attach + Studio UI hide run automatically (see attach_guardrails_*).")
 
 
+def _ensure_project_role_trusts_lambda(iam, role_name: str, lambda_role_arn: str) -> None:
+    """Allow usage-monitor Lambda to AssumeRole into project user roles (for StopCompute)."""
+    if not lambda_role_arn:
+        return
+    try:
+        role = iam.get_role(RoleName=role_name)["Role"]
+        doc = role["AssumeRolePolicyDocument"]
+        if isinstance(doc, str):
+            doc = json.loads(doc)
+        statements = list(doc.get("Statement") or [])
+        desired_actions = [
+            "sts:AssumeRole",
+            "sts:TagSession",
+            "sts:SetContext",
+            "sts:SetSourceIdentity",
+        ]
+        updated = False
+        found = False
+        for stmt in statements:
+            principal = stmt.get("Principal") or {}
+            aws_p = principal.get("AWS")
+            arns = aws_p if isinstance(aws_p, list) else ([aws_p] if aws_p else [])
+            if lambda_role_arn not in arns:
+                continue
+            found = True
+            actions = stmt.get("Action")
+            action_list = actions if isinstance(actions, list) else [actions]
+            if set(desired_actions).issubset(set(action_list)):
+                return
+            stmt["Action"] = desired_actions
+            updated = True
+            break
+        if not found:
+            statements.append(
+                {
+                    "Effect": "Allow",
+                    "Principal": {"AWS": lambda_role_arn},
+                    "Action": desired_actions,
+                }
+            )
+            updated = True
+        if not updated:
+            return
+        doc["Statement"] = statements
+        iam.update_assume_role_policy(
+            RoleName=role_name, PolicyDocument=json.dumps(doc)
+        )
+        print(f"  ✓ trust lambda assume → {role_name}")
+    except ClientError as e:
+        print(f"  ! trust update {role_name}: {e.response['Error'].get('Message', e)}")
+
+
 def attach_guardrails_to_project_roles(iam, cfg: Dict[str, Any]) -> List[str]:
     """Attach instance-type Deny policy to all DataZone project user roles."""
     print("\n==> Attaching guardrails to project user roles")
     policy_arn = (cfg.get("resources") or {}).get("guardrails_policy_arn")
+    account_id = (cfg.get("resources") or {}).get("account_id")
+    if not account_id:
+        account_id = boto3.client("sts").get_caller_identity()["Account"]
     if not policy_arn:
-        account_id = (cfg.get("resources") or {}).get("account_id")
-        if not account_id:
-            account_id = boto3.client("sts").get_caller_identity()["Account"]
         policy_arn = f"arn:aws:iam::{account_id}:policy/{POLICY_GUARDRAILS}"
         set_resource(cfg, "guardrails_policy_arn", policy_arn)
+
+    lambda_role_arn = (cfg.get("resources") or {}).get("lambda_usage_role_arn") or (
+        f"arn:aws:iam::{account_id}:role/{ROLE_LAMBDA_USAGE}"
+    )
 
     attached: List[str] = []
     paginator = iam.get_paginator("list_roles")
@@ -865,6 +949,31 @@ def attach_guardrails_to_project_roles(iam, cfg: Dict[str, Any]) -> List[str]:
                 else:
                     iam.attach_role_policy(RoleName=name, PolicyArn=policy_arn)
                     print(f"  ✓ attached guardrails → {name}")
+                # Portal Stop uses *Notebook*; REST StopCompute needs explicit allow for post-hoc guard
+                iam.put_role_policy(
+                    RoleName=name,
+                    PolicyName="smus-notebook-compute-stop",
+                    PolicyDocument=json.dumps(
+                        {
+                            "Version": "2012-10-17",
+                            "Statement": [
+                                {
+                                    "Sid": "AllowStopNotebookComputeRest",
+                                    "Effect": "Allow",
+                                    "Action": [
+                                        "datazone:StopCompute",
+                                        "datazone:GetCompute",
+                                        "datazone:StopNotebookCompute",
+                                        "datazone:GetNotebookCompute",
+                                        "datazone:GetEnvironmentCredentials",
+                                    ],
+                                    "Resource": "*",
+                                }
+                            ],
+                        }
+                    ),
+                )
+                _ensure_project_role_trusts_lambda(iam, name, lambda_role_arn)
                 attached.append(name)
             except ClientError as e:
                 print(f"  ! {name}: {e.response['Error'].get('Message', e)}")
@@ -1272,6 +1381,7 @@ def deploy_monitoring_lambdas(lam, events, cfg: Dict[str, Any], role_arn: str) -
             "COST_TABLE": TABLE_COST,
             "METRIC_NAMESPACE": f"SMUS/{PROJECT_NAME}",
             "GUARDRAILS_POLICY_ARN": guardrails_arn,
+            "ALLOWED_NOTEBOOK_INSTANCE_TYPES": ",".join(ALLOWED_NOTEBOOK_INSTANCE_TYPES),
         }
     }
 
@@ -1429,10 +1539,173 @@ def deploy_monitoring_lambdas(lam, events, cfg: Dict[str, Any], role_arn: str) -
     except ClientError:
         pass
 
-    set_resource(cfg, "eventbridge_rules", [rule_reconcile, rule_cost, rule_api])
-    print("  ✓ monitoring schedules + API rule configured")
+    # Notebooks sc.* post-hoc guard (CloudTrail StartNotebookCompute → StopCompute)
+    rule_notebook = f"rule-smus-notebook-guard-for-{PROJECT_NAME}"
+    events.put_rule(
+        Name=rule_notebook,
+        EventPattern=json.dumps(
+            {
+                "source": ["aws.datazone"],
+                "detail-type": ["AWS API Call via CloudTrail"],
+                "detail": {
+                    "eventSource": ["datazone.amazonaws.com"],
+                    "eventName": ["StartNotebookCompute"],
+                },
+            }
+        ),
+        State="ENABLED",
+        Description="SMUS Notebooks StartNotebookCompute → post-hoc instance guard",
+    )
+    events.put_targets(
+        Rule=rule_notebook,
+        Targets=[{"Id": "notebookGuard", "Arn": usage_arn}],
+    )
+    try:
+        lam.add_permission(
+            FunctionName=LAMBDA_USAGE,
+            StatementId="AllowEventBridgeNotebookGuard",
+            Action="lambda:InvokeFunction",
+            Principal="events.amazonaws.com",
+            SourceArn=(
+                f"arn:aws:events:{REGION}:{cfg['resources'].get('account_id')}"
+                f":rule/{rule_notebook}"
+            ),
+        )
+    except ClientError:
+        pass
+
+    set_resource(
+        cfg,
+        "eventbridge_rules",
+        [rule_reconcile, rule_cost, rule_api, rule_notebook],
+    )
+    set_resource(
+        cfg,
+        "allowed_notebook_instance_types",
+        ALLOWED_NOTEBOOK_INSTANCE_TYPES,
+    )
+    print("  ✓ monitoring schedules + API + notebook-guard rules configured")
+    print(
+        "  · Notebooks allowlist (post-hoc StopCompute): "
+        + ", ".join(ALLOWED_NOTEBOOK_INSTANCE_TYPES)
+    )
     print("  ! Cost Explorer: Billing → Cost allocation tags 에서")
     print("    sagemaker:user-profile-arn / sagemaker:space-arn / Project 활성화 필요 (24~48h)")
+
+    deploy_notebook_deny_alarm(cfg)
+
+
+def deploy_notebook_deny_alarm(cfg: Dict[str, Any]) -> None:
+    """
+    Alarm when unauthorized Notebooks sc.* is detected.
+    Stop is not reliable (DataZone portal authz); detection → SNS is the ops path.
+    """
+    print("\n==> Notebook deny SNS + CloudWatch alarm")
+    account_id = (cfg.get("resources") or {}).get("account_id")
+    if not account_id:
+        account_id = boto3.client("sts").get_caller_identity()["Account"]
+        set_resource(cfg, "account_id", account_id)
+
+    sns = boto3.client("sns", region_name=REGION)
+    cw = boto3.client("cloudwatch", region_name=REGION)
+    namespace = f"SMUS/{PROJECT_NAME}"
+
+    topic = sns.create_topic(
+        Name=SNS_NOTEBOOK_DENY,
+        Tags=[
+            {"Key": "Project", "Value": PROJECT_NAME},
+            {"Key": "ManagedBy", "Value": "smus-installer"},
+        ],
+    )
+    topic_arn = topic["TopicArn"]
+    set_resource(cfg, "notebook_deny_sns_arn", topic_arn)
+    print(f"  ✓ SNS topic {SNS_NOTEBOOK_DENY}")
+
+    email = (cfg.get("auth") or {}).get("idc_admin_email") or ""
+    if email and "@" in email:
+        try:
+            sns.subscribe(TopicArn=topic_arn, Protocol="email", Endpoint=email)
+            print(f"  · email subscription requested → {email} (confirm in inbox)")
+            set_resource(cfg, "notebook_deny_sns_email", email)
+        except ClientError as e:
+            print(f"  ! sns subscribe: {e}")
+    else:
+        print("  ! no auth.idc_admin_email — subscribe manually to the SNS topic")
+
+    # Allow CloudWatch to publish to the topic
+    sns.set_topic_attributes(
+        TopicArn=topic_arn,
+        AttributeName="Policy",
+        AttributeValue=json.dumps(
+            {
+                "Version": "2012-10-17",
+                "Statement": [
+                    {
+                        "Sid": "AllowCWPublish",
+                        "Effect": "Allow",
+                        "Principal": {"Service": "cloudwatch.amazonaws.com"},
+                        "Action": "sns:Publish",
+                        "Resource": topic_arn,
+                        "Condition": {
+                            "ArnLike": {
+                                "aws:SourceArn": (
+                                    f"arn:aws:cloudwatch:{REGION}:{account_id}:alarm:{ALARM_NOTEBOOK_DENY}"
+                                )
+                            }
+                        },
+                    },
+                    {
+                        "Sid": "AllowAccountOwner",
+                        "Effect": "Allow",
+                        "Principal": {"AWS": f"arn:aws:iam::{account_id}:root"},
+                        "Action": [
+                            "sns:Subscribe",
+                            "sns:Receive",
+                            "sns:Publish",
+                            "sns:GetTopicAttributes",
+                            "sns:SetTopicAttributes",
+                        ],
+                        "Resource": topic_arn,
+                    },
+                ],
+            }
+        ),
+    )
+
+    allowed = ", ".join(ALLOWED_NOTEBOOK_INSTANCE_TYPES)
+    cw.put_metric_alarm(
+        AlarmName=ALARM_NOTEBOOK_DENY,
+        AlarmDescription=(
+            f"SMUS Notebooks unauthorized instance detected for {PROJECT_NAME}. "
+            f"Allowed sc.* only: {allowed}. "
+            "Automatic StopCompute is not reliable (DataZone portal authz); "
+            "investigate portal / DDB inventory NOTEBOOK#* and stop manually if needed."
+        ),
+        Namespace=namespace,
+        MetricName="NotebookComputeDeniedTotal",
+        Statistic="Sum",
+        Period=60,
+        EvaluationPeriods=1,
+        DatapointsToAlarm=1,
+        Threshold=1.0,
+        ComparisonOperator="GreaterThanOrEqualToThreshold",
+        TreatMissingData="notBreaching",
+        ActionsEnabled=True,
+        AlarmActions=[topic_arn],
+        OKActions=[],
+        Tags=[
+            {"Key": "Project", "Value": PROJECT_NAME},
+            {"Key": "ManagedBy", "Value": "smus-installer"},
+        ],
+    )
+    set_resource(cfg, "notebook_deny_alarm_name", ALARM_NOTEBOOK_DENY)
+    alarm_url = (
+        f"https://{REGION}.console.aws.amazon.com/cloudwatch/home"
+        f"?region={REGION}#alarmsV2:alarm/{ALARM_NOTEBOOK_DENY}"
+    )
+    set_resource(cfg, "notebook_deny_alarm_url", alarm_url)
+    print(f"  ✓ alarm {ALARM_NOTEBOOK_DENY} (metric NotebookComputeDeniedTotal >= 1 / 1m)")
+    print(f"  · {alarm_url}")
 
 
 def run_dashboard() -> None:
@@ -1459,6 +1732,7 @@ def main() -> int:
     cfg["domain_name"] = DOMAIN_NAME
     cfg["domain_version"] = DOMAIN_VERSION
     cfg["allowed_instance_types"] = ALLOWED_INSTANCE_TYPES
+    cfg["allowed_notebook_instance_types"] = ALLOWED_NOTEBOOK_INSTANCE_TYPES
     cfg.setdefault("features", {})
     cfg["features"].update(
         {
@@ -1466,6 +1740,7 @@ def main() -> int:
             "direct_connect": False,
             "data_agent_disabled": True,
             "monitoring_enabled": True,
+            "notebook_compute_posthoc_guard": True,
         }
     )
     cfg.setdefault("auth", {})

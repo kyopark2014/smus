@@ -131,12 +131,26 @@ def build_body(cfg: Dict[str, Any]) -> Dict[str, Any]:
             period=86400,
             stat="Sum",
         ),
+        _metric_widget(
+            "Notebooks unauthorized sc.* (detect / alarm)",
+            [
+                [ns, "NotebookComputeDeniedTotal"],
+                [ns, "NotebookComputeDenied", "InstanceType", "sc.g5.xlarge"],
+                [ns, "NotebookComputeDenied", "InstanceType", "sc.g5.2xlarge"],
+                [ns, "NotebookComputeDenied", "InstanceType", "sc.g4dn.2xlarge"],
+            ],
+            region,
+            period=60,
+            stat="Sum",
+        ),
         _text_widget(
-            """## How to drill down
+            f"""## How to drill down
 1. DynamoDB → inventory: filter `resource_type = Space` → `owner_user_profile`, `instance_type`, `app_type`, `status`
 2. DynamoDB → usage-events: Create/Update/Delete timeline
 3. DynamoDB → cost-by-user: daily UnblendedCost by `sagemaker:user-profile-arn`
 4. Enable Billing → Cost allocation tags: `Project`, `sagemaker:user-profile-arn`, `sagemaker:space-arn`
+5. Notebooks deny alarm: `{resources.get("notebook_deny_alarm_name") or "alarm-smus-notebook-deny-for-" + project}`  
+   SNS: `{resources.get("notebook_deny_sns_arn") or "(pending)"}` — **detect only** (force stop not reliable)
 """
         ),
     ]

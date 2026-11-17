@@ -277,6 +277,31 @@ def main() -> int:
         except ClientError as e:
             print(f"· dashboard: {e}")
 
+    alarm = res.get("notebook_deny_alarm_name") or f"alarm-smus-notebook-deny-for-{project}"
+    try:
+        cw.delete_alarms(AlarmNames=[alarm])
+        print(f"✓ deleted alarm {alarm}")
+    except ClientError as e:
+        print(f"· alarm {alarm}: {e}")
+
+    sns_arn = res.get("notebook_deny_sns_arn")
+    if sns_arn:
+        sns = boto3.client("sns", region_name=region)
+        try:
+            for sub in sns.list_subscriptions_by_topic(TopicArn=sns_arn).get(
+                "Subscriptions"
+            ) or []:
+                arn = sub.get("SubscriptionArn") or ""
+                if arn.startswith("arn:"):
+                    try:
+                        sns.unsubscribe(SubscriptionArn=arn)
+                    except ClientError:
+                        pass
+            sns.delete_topic(TopicArn=sns_arn)
+            print(f"✓ deleted sns {sns_arn}")
+        except ClientError as e:
+            print(f"· sns {sns_arn}: {e}")
+
     if args.delete_domain and res.get("domain_id"):
         try:
             datazone.delete_domain(identifier=res["domain_id"], skipDeletionCheck=True)
