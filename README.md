@@ -97,9 +97,30 @@ Organization IdC primary가 **Tokyo (`ap-northeast-1`)** 이므로 SMUS도 동�
 3. model provisioning / consumption role 연결
 4. 트래픽은 PrivateLink로 VPC 내 유지
 
+## Notebooks vs JupyterLab
+
+SMUS 왼쪽 메뉴에 **Notebooks**와 **JupyterLab**(IDEs)이 따로 있습니다. 둘은 다른 코딩 경험입니다.
+
+| | **Notebooks** (메뉴: Notebooks) | **JupyterLab** (메뉴: IDEs) |
+|--|--|--|
+| 성격 | SMUS의 **새 서버리스 노트북** UI | 전통적인 **JupyterLab IDE** (Space 기반) |
+| 용도 | 데이터 탐색·분석·SQL/Spark에 맞춘 경량 환경 | 커스터마이징·플러그인·본격 ML 개발 |
+| 셀 | Python, SQL, Spark, 자연어, 테이블/차트 셀 | 일반 Jupyter 노트북/터미널/파일 브라우저 |
+| AI | **SageMaker Data Agent** 내장에 가깝게 설계 | Amazon Q 등 IDE 쪽 보조 |
+| 컴퓨트 | 관리형/서버리스 노트북 컴퓨트 (Athena Spark 등) | EC2 Space (`ml.t3.*` 등) |
+| 인스턴스 제한 | 이 README의 Space IAM Deny와는 경로가 다름 | **아래 인스턴스 제한의 주 대상** |
+
+한 줄 요약: **Notebooks = 데이터/SQL 중심의 새 노트북**, **JupyterLab = Space를 띄우는 기존 Jupyter IDE**.
+
+참고:
+
+- [Notebooks](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/notebooks.html)
+- [JupyterLab IDE](https://docs.aws.amazon.com/sagemaker-unified-studio/latest/userguide/jupyterlab.html)
+
 ## 노트북/Space 인스턴스 제한
 
-허용 타입: **`ml.t3.medium`**, **`ml.t3.large`**, **`ml.t3.xlarge`**
+허용 타입: **`ml.t3.medium`**, **`ml.t3.large`**, **`ml.t3.xlarge`**  
+(주로 **JupyterLab Space**의 `CreateApp` / `CreateSpace` / `UpdateSpace`에 적용)
 
 ### 동작 방식
 
